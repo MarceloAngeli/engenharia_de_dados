@@ -66,7 +66,7 @@ To run the benchmark execute the command "python export.py" from inside the /src
 ## 5 - Question Answer
 
 Using a lakehouse. The reasoning behind it lies both in the file type, size and processing speed.
-First, an e-commerce website such as Olist would likely contain images and more JSONs. This type of unstructured is not supported by data warehouses. Regarding the file size, the benchmark shows that the data compression would reduce a huge part of the innerent waste of the data lakes. Moreover, the approach implemented showed an excellent querying speed, one of the main upsides of a data warehouse.
+First, an e-commerce website such as Olist would likely contain images and more JSONs. Such type of data is considereded "unstructured" and is not supported by data warehouses. Regarding the file size, the benchmark shows that the data compression would reduce a huge part of the innerent storage waste of the data lakes. Moreover, the approach implemented showed an excellent querying speed, one of the main upsides of a data warehouse. That said it is clear that a neither a data warehouse or data lake would be the adequate solutions, indicating the necessity of a hybrid approach.  
 
 
 ```mermaid
