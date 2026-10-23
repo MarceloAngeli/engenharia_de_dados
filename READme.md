@@ -13,28 +13,22 @@ There were multiple inconsistencies found in both json and csv files. Regarding 
 
 For the csv files there were problems with orphage rows, especially with the seller and orders CSVs. See tables bellow.
 
-┌───────────────────────────────────────────────────┬──────────────────┬────────────────────────┬───────────────┐
-│                     fk_check                      │ distinct_checked │ distinct_without_match │ rows_affected │
-│                      varchar                      │      int64       │         int64          │    int128     │
-├───────────────────────────────────────────────────┼──────────────────┼────────────────────────┼───────────────┤
-│ order_items.order_id -> orders_raw.order_id       │            98666 │                      1 │             1 │
-│ order_payments.order_id -> orders_raw.order_id    │            99440 │                      1 │             1 │
-│ orders_raw.order_id -> order_items.order_id       │            99441 │                    776 │           776 │
-└───────────────────────────────────────────────────┴──────────────────┴────────────────────────┴───────────────┘
 
-Something similar happened when trying to merge the JSON file with the CSV for the sellers. ┌──────────────────────────────────────────────────────────────────────────┬──────────────────┬──────────────────────┐
-│                                check_name                                │ distinct_checked │distinct_without_match|
-│                                 varchar                                  │      int64       │        int64         |
-├──────────────────────────────────────────────────────────────────────────┼──────────────────┼──────────────────────┤
-│ sellers_clean (JSON) -> olist_sellers (CSV)                              │             3070 │                   15 │
-├──────────────────────────────────────────────────────────────────────────┼──────────────────┼──────────────────────┤
-│ olist_sellers (CSV) -> sellers_clean (JSON)                              │             3095 │                   40 │
-├──────────────────────────────────────────────────────────────────────────┼──────────────────┼─────────────────────|
-│ order_items -> sellers_clean (JSON)                                      │             3095 │                   40 │
-├──────────────────────────────────────────────────────────────────────────┼──────────────────┼──────────────────────┤
-│ sellers_clean (JSON) -> order_items (informational: profiles with no     │             3070 │                   15 │
-│ sales)                                                                   │                  |                      │
-└──────────────────────────────────────────────────────────────────────────┴──────────────────┴──────────────────────┘
+| fk_check | distinct_checked | distinct_without_match | rows_affected |
+|---|--:|--:|--:|
+| order_items.order_id → orders_raw.order_id | 98.666 | 1 | 1 |
+| order_payments.order_id → orders_raw.order_id | 99.440 | 1 | 1 |
+| orders_raw.order_id → order_items.order_id | 99.441 | 776 | 776 |
+
+Something similar happened when trying to merge the JSON file with the CSV for the sellers. 
+
+| check_name | distinct_checked | distinct_without_match |
+|---|--:|--:|
+| sellers_clean (JSON) → olist_sellers (CSV) | 3.070 | 15 |
+| olist_sellers (CSV) → sellers_clean (JSON) | 3.095 | 40 |
+| order_items → sellers_clean (JSON) | 3.095 | 40 |
+| sellers_clean (JSON) → order_items (informativo: perfis sem vendas) | 3.070 | 15 |
+
 
 Another issue found was the geolocation dimension. This dimension itself has basically not been cleaned as this would take manual validation. This happens because mispelled cities are hard to recognize and can refer to legitimate cities. Eg: Palma (MG) e Palmas (TO). Moreover, there are cities with the exact same name, eg: Bonito (PA) and Bonito (PA). There are also multiple ZIP_PREFIXES with different latitudes and longitudes. None of the problems stated above were solved. 
 
