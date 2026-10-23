@@ -2,36 +2,35 @@ import os
 import shutil
 import statistics
 import time
-
 import duckdb
 
 DB_PATH = (
-    "/home/MarceloHenriqueGuidiniAngeli/Documents/Codigos/"
-    "EngenhariaDeDadosIPB/src/olist.duckdb"
+    "./../sql/olist.duckdb"
 )
 # Everything is written to <architecture>/data/curated/
 CURATED_DIR = (
-    "/home/MarceloHenriqueGuidiniAngeli/Documents/Codigos/"
-    "EngenhariaDeDadosIPB/architecture/data/curated"
+    "./../architecture/data/curated"
 )
 
 FACT = "fact_order_items"
-PARTITION_COL = "purchase_month"     # 'YYYY-MM', derived from order_purchase_timestamp
+# 'YYYY-MM', derived from the fact column order_purchase_timestamp.
+# (Partitioning by the raw timestamp would create one folder per distinct
+# second; the month keeps the number of partitions small.)
+PARTITION_COL = "purchase_month"
 PARQUET_COMPRESSION = "snappy"
 
 # Every table of the model except the fact. Each one is exported as one CSV.
 DIMENSIONS = [
-    "dim_category_translation",
-    "dim_geolocation",
-    "dim_date",
+    "dim_category_name_translation",
+    "dim_geo",
     "dim_product",
     "dim_customer",
     "dim_carrier",
     "dim_seller",
     "bridge_seller_carrier",
-    "dim_delivery",
+    "dim_dates",
     "dim_review",
-    "dim_payment",
+    "dim_payment_details",
 ]
 
 # Month used by query 2. If it has no rows, the busiest month is used instead.
@@ -42,6 +41,11 @@ RUNS = 10
 
 # Revenue = sum of the item price (freight is not revenue). Change here if needed.
 REVENUE = "price"
+
+# After the export, print the first rows of every CSV file that was written.
+SHOW_CSV_PREVIEW = True
+PREVIEW_ROWS = 5
+PREVIEW_COL_WIDTH = 18       # longer values are cut in the preview only
 
 # The same three queries run on every layout. {src} is replaced by the table
 # expression that reads that layout.
@@ -62,7 +66,8 @@ QUERIES = {
                         c.product_category_name) AS category,
                ROUND(SUM(f.{rev}), 2) AS revenue
         FROM {{src}} f
-        JOIN dim_category_translation c ON f.category_key = c.category_key
+        JOIN dim_category_name_translation c
+          ON f.product_category_name = c.product_category_name
         GROUP BY 1
         ORDER BY revenue DESC, category
         LIMIT 5
@@ -131,13 +136,14 @@ def export_dimensions(con) -> None:
             os.remove(path)
 
         n_rows = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        # ORDER BY 1 = the surrogate key (first column): stable, diff-friendly files
+        # ORDER BY ALL = sort by every column, left to right (the key columns come
+        # first): stable, diff-friendly files, even for dim_geo where zip repeats
         con.execute(f"""
-            COPY (SELECT * FROM {table} ORDER BY 1)
+            COPY (SELECT * FROM {table} ORDER BY ALL)
             TO '{path}' (FORMAT csv, HEADER true)
         """)
         size, _ = disk_usage(path)
-        print(f"  {table:26} {n_rows:>8} rows  {human(size):>10}  -> {table}.csv")
+        print(f"  {table:30} {n_rows:>8} rows  {human(size):>10}  -> {table}.csv")
 
 
 # ============================================================
@@ -148,9 +154,10 @@ def export_layouts(con) -> None:
     """
     Write the fact table as CSV (one file), Parquet (one file) and Parquet
     partitioned by purchase_month. Every layout carries the derived column
-    purchase_month: stored as a normal column in the unpartitioned files, and
-    encoded in the folder name (purchase_month=2017-11/) in the partitioned
-    one. This lets the same SQL run on every layout.
+    purchase_month (from order_purchase_timestamp): stored as a normal column
+    in the unpartitioned files, and encoded in the folder name
+    (purchase_month=2017-11/) in the partitioned one. This lets the same SQL
+    run on every layout.
     """
     banner("EXPORT: FACT TABLE (3 LAYOUTS)")
     os.makedirs(CURATED_DIR, exist_ok=True)
@@ -182,6 +189,59 @@ def export_layouts(con) -> None:
         size, files = disk_usage(path)
         print(f"  {name:20} -> {target:30} {human(size):>10}  "
               f"{files:>3} file(s)  written in {elapsed:.2f}s")
+
+
+# ============================================================
+# STEP 1C - LOOK AT THE CSV FILES THAT WERE WRITTEN
+# ============================================================
+
+def csv_paths() -> list[str]:
+    """Every CSV the export wrote: the fact table first, then the dimensions."""
+    fact_csv = next(target for name, target, fmt, partitioned in LAYOUTS
+                    if fmt == "csv")
+    return [os.path.join(CURATED_DIR, fact_csv)] + [
+        os.path.join(CURATED_DIR, f"{table}.csv") for table in DIMENSIONS
+    ]
+
+
+def clip(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 2] + ".."
+
+
+def preview_csv(con, path: str) -> None:
+    """Print the first rows of one CSV, read back from the file itself."""
+    # all_varchar: show the text exactly as stored (a zip prefix such as 01037
+    # must not be turned into the number 1037 just for display).
+    cur = con.execute(
+        f"SELECT * FROM read_csv('{path}', header = true, all_varchar = true) "
+        f"LIMIT {PREVIEW_ROWS}"
+    )
+    columns = [d[0] for d in cur.description]
+    rows = [
+        ["NULL" if v is None else str(v).replace("\r", " ").replace("\n", " ")
+         for v in row]
+        for row in cur.fetchall()
+    ]
+    widths = [
+        min(PREVIEW_COL_WIDTH, max([len(col)] + [len(r[i]) for r in rows]))
+        for i, col in enumerate(columns)
+    ]
+
+    size, _ = disk_usage(path)
+    print(f"\n{os.path.basename(path)}  ({human(size)})")
+    print("  " + " | ".join(clip(c, w).ljust(w) for c, w in zip(columns, widths)))
+    print("  " + "-+-".join("-" * w for w in widths))
+    for row in rows:
+        print("  " + " | ".join(clip(v, w).ljust(w) for v, w in zip(row, widths)))
+
+
+def preview_csvs(con) -> None:
+    banner(f"PREVIEW: CSV FILES (first {PREVIEW_ROWS} rows of each)")
+    print(f"Folder: {os.path.abspath(CURATED_DIR)}")
+    print("Shown as stored in the files; an empty cell appears as NULL and "
+          f"values longer than {PREVIEW_COL_WIDTH} characters are cut.")
+    for path in csv_paths():
+        preview_csv(con, path)
 
 
 # ============================================================
@@ -338,6 +398,8 @@ def main() -> None:
 
     export_dimensions(con)
     export_layouts(con)
+    if SHOW_CSV_PREVIEW:
+        preview_csvs(con)
     sizes, times = benchmark(con)
     report(sizes, times)
 

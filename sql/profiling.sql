@@ -1,18 +1,16 @@
 -- ============================================================================
 -- profiling.sql  -  profile and clean the raw NorthMart / Olist files (DuckDB)
 --
--- Replaces: validate_customers_dataset.py, validate_database.py,
---           validate_geolocation_dataset.py, validate_json.py,
---           validate_order_items_dataset.py, validate_payment.py,
---           validate_products.py, validate_sellers.py
 --
 -- Run from the src folder (paths below are relative to it):
 --     cd src
 --     duckdb -bail olist.duckdb < profiling.sql
 --
 -- Every SELECT prints a result. An empty result means "nothing found".
+-- ALL validations of the raw data live in this script. build_model.sql only
+-- builds the model and checks its own output.
 -- The script also builds the cleaned tables that build_model.sql needs:
---     products, sellers_clean, orders_clean, order_delivery_dates
+--     products, sellers_clean, orders_clean, order_dates
 -- so profiling.sql must run BEFORE build_model.sql.
 -- ============================================================================
 
@@ -28,18 +26,30 @@ SELECT * FROM read_csv_auto('../architecture/data/source/olist_orders_dataset.cs
 CREATE OR REPLACE TABLE order_items AS
 SELECT * FROM read_csv_auto('../architecture/data/source/olist_order_items_dataset.csv', header = true);
 
+-- Zip prefixes stay VARCHAR (same type as geo) to keep leading zeros and to
+-- compare equal with the geolocation zips.
 CREATE OR REPLACE TABLE customers AS
-SELECT * FROM read_csv_auto('../architecture/data/source/olist_customers_dataset.csv', header = true);
+SELECT * FROM read_csv('../architecture/data/source/olist_customers_dataset.csv',
+                       header = true,
+                       types = {'customer_zip_code_prefix': 'VARCHAR'});
 
 CREATE OR REPLACE TABLE order_payments AS
 SELECT * FROM read_csv_auto('../architecture/data/source/olist_order_payments_dataset.csv', header = true);
 
 CREATE OR REPLACE TABLE olist_sellers AS
-SELECT * FROM read_csv_auto('../architecture/data/source/olist_sellers_dataset.csv', header = true);
+SELECT * FROM read_csv('../architecture/data/source/olist_sellers_dataset.csv',
+                       header = true,
+                       types = {'seller_zip_code_prefix': 'VARCHAR'});
 
 -- raw_products stays untouched; "products" (below) receives the cleaning.
 CREATE OR REPLACE TABLE raw_products AS
 SELECT * FROM read_csv_auto('../architecture/data/source/olist_products_dataset.csv', header = true);
+
+CREATE OR REPLACE TABLE order_reviews AS
+SELECT * FROM read_csv_auto('../architecture/data/source/olist_order_reviews_dataset.csv', header = true);
+
+CREATE OR REPLACE TABLE category_translation AS
+SELECT * FROM read_csv_auto('../architecture/data/source/product_category_name_translation.csv', header = true);
 
 -- The zip prefix stays VARCHAR to keep leading zeros.
 CREATE OR REPLACE TABLE geo AS
@@ -56,13 +66,15 @@ FROM read_json_objects('../architecture/data/source/json_northmart_seller_profil
 
 SELECT 'Row counts of the loaded raw files:' AS section;
 SELECT 'orders_raw' AS table_name, COUNT(*) AS row_count FROM orders_raw
-UNION ALL SELECT 'order_items',    COUNT(*) FROM order_items
-UNION ALL SELECT 'customers',      COUNT(*) FROM customers
-UNION ALL SELECT 'order_payments', COUNT(*) FROM order_payments
-UNION ALL SELECT 'olist_sellers',  COUNT(*) FROM olist_sellers
-UNION ALL SELECT 'raw_products',   COUNT(*) FROM raw_products
-UNION ALL SELECT 'geo',            COUNT(*) FROM geo
-UNION ALL SELECT 'sellers_raw (JSON)', COUNT(*) FROM sellers_raw;
+UNION ALL SELECT 'order_items',         COUNT(*) FROM order_items
+UNION ALL SELECT 'customers',           COUNT(*) FROM customers
+UNION ALL SELECT 'order_payments',      COUNT(*) FROM order_payments
+UNION ALL SELECT 'olist_sellers',       COUNT(*) FROM olist_sellers
+UNION ALL SELECT 'raw_products',        COUNT(*) FROM raw_products
+UNION ALL SELECT 'order_reviews',       COUNT(*) FROM order_reviews
+UNION ALL SELECT 'category_translation', COUNT(*) FROM category_translation
+UNION ALL SELECT 'geo',                 COUNT(*) FROM geo
+UNION ALL SELECT 'sellers_raw (JSON)',  COUNT(*) FROM sellers_raw;
 
 
 -- ============================================================================
@@ -112,7 +124,7 @@ GROUP BY customer_id, customer_unique_id, customer_zip_code_prefix,
          customer_city, customer_state
 HAVING COUNT(*) > 1;
 
-SELECT 'Customers: repeated customer_id (should be unique):' AS section;
+SELECT 'Customers: repeated customer_id (should be unique, it is the dim_customer PK):' AS section;
 SELECT customer_id, COUNT(*) AS occurrences
 FROM customers
 GROUP BY customer_id
@@ -121,7 +133,9 @@ ORDER BY occurrences DESC;
 
 
 -- ============================================================================
--- STEP 2 - ORDERS: key profile, then split the delivery dates
+-- STEP 2 - ORDERS: key profile, date checks, then the order tables
+-- orders_clean : one row per order (customer, status, purchase timestamp, dates_id)
+-- order_dates  : one row per order (approved / carrier / customer / estimated dates)
 -- ============================================================================
 SELECT '=== STEP 2 - ORDERS: KEY PROFILE ===' AS section;
 
@@ -136,36 +150,50 @@ FROM orders_raw;
 SELECT CASE
          WHEN COUNT(*) FILTER (WHERE order_id IS NULL) = 0
           AND COUNT(DISTINCT order_id) = COUNT(*)
-         THEN 'order_id is a valid key: building orders_clean and order_delivery_dates'
+         THEN 'order_id is a valid key: building orders_clean and order_dates'
          ELSE error('order_id is not a valid key (NULLs or duplicates found). '
                     || 'Fix this first. The new tables were NOT built.')
        END AS order_id_guard
 FROM orders_raw;
 
--- delivery_id is a deterministic md5 of the order_id (32 hex characters),
--- the same style as order_id, product_id, etc.
-CREATE OR REPLACE TABLE order_delivery_dates (
-    delivery_id VARCHAR PRIMARY KEY,
-    order_delivered_carrier_date TIMESTAMP,
-    order_delivered_customer_date TIMESTAMP,
-    order_estimated_delivery_date TIMESTAMP
-);
+-- Values that cannot be cast to TIMESTAMP become NULL in the tables below.
+SELECT 'Date values that cannot be cast to TIMESTAMP (they become NULL):' AS section;
+SELECT column_name, COUNT(*) AS not_castable
+FROM (
+    SELECT 'order_purchase_timestamp' AS column_name FROM orders_raw
+    WHERE CAST(order_purchase_timestamp AS VARCHAR) IS NOT NULL
+      AND TRY_CAST(order_purchase_timestamp AS TIMESTAMP) IS NULL
+    UNION ALL
+    SELECT 'order_approved_at' FROM orders_raw
+    WHERE CAST(order_approved_at AS VARCHAR) IS NOT NULL
+      AND TRY_CAST(order_approved_at AS TIMESTAMP) IS NULL
+    UNION ALL
+    SELECT 'order_delivered_carrier_date' FROM orders_raw
+    WHERE CAST(order_delivered_carrier_date AS VARCHAR) IS NOT NULL
+      AND TRY_CAST(order_delivered_carrier_date AS TIMESTAMP) IS NULL
+    UNION ALL
+    SELECT 'order_delivered_customer_date' FROM orders_raw
+    WHERE CAST(order_delivered_customer_date AS VARCHAR) IS NOT NULL
+      AND TRY_CAST(order_delivered_customer_date AS TIMESTAMP) IS NULL
+    UNION ALL
+    SELECT 'order_estimated_delivery_date' FROM orders_raw
+    WHERE CAST(order_estimated_delivery_date AS VARCHAR) IS NOT NULL
+      AND TRY_CAST(order_estimated_delivery_date AS TIMESTAMP) IS NULL
+)
+GROUP BY column_name
+ORDER BY column_name;
 
-INSERT INTO order_delivery_dates
-SELECT
-    md5('delivery|' || order_id),
-    TRY_CAST(order_delivered_carrier_date AS TIMESTAMP),
-    TRY_CAST(order_delivered_customer_date AS TIMESTAMP),
-    TRY_CAST(order_estimated_delivery_date AS TIMESTAMP)
-FROM orders_raw;
+-- Leftover from the previous version of the model (replaced by order_dates)
+DROP TABLE IF EXISTS order_delivery_dates;
 
+-- dates_id is an integer 1..N numbered by ORDER BY order_id, so a re-run on
+-- the same data gives exactly the same ids.
 CREATE OR REPLACE TABLE orders_clean (
     order_id VARCHAR PRIMARY KEY,
     customer_id VARCHAR,
     order_status VARCHAR,
     order_purchase_timestamp TIMESTAMP,
-    order_approved_at TIMESTAMP,
-    delivery_id VARCHAR
+    dates_id INTEGER UNIQUE
 );
 
 INSERT INTO orders_clean
@@ -174,34 +202,53 @@ SELECT
     customer_id,
     order_status,
     TRY_CAST(order_purchase_timestamp AS TIMESTAMP),
-    TRY_CAST(order_approved_at AS TIMESTAMP),
-    md5('delivery|' || order_id)
+    CAST(ROW_NUMBER() OVER (ORDER BY order_id) AS INTEGER)
 FROM orders_raw;
+
+CREATE OR REPLACE TABLE order_dates (
+    dates_id INTEGER PRIMARY KEY,
+    order_approved_at TIMESTAMP,
+    order_delivered_carrier_date TIMESTAMP,
+    order_delivered_customer_date TIMESTAMP,
+    order_estimated_delivery_date TIMESTAMP
+);
+
+INSERT INTO order_dates
+SELECT
+    o.dates_id,
+    TRY_CAST(r.order_approved_at AS TIMESTAMP),
+    TRY_CAST(r.order_delivered_carrier_date AS TIMESTAMP),
+    TRY_CAST(r.order_delivered_customer_date AS TIMESTAMP),
+    TRY_CAST(r.order_estimated_delivery_date AS TIMESTAMP)
+FROM orders_clean o
+JOIN orders_raw r ON o.order_id = r.order_id;
 
 SELECT 'Verification of the new order tables:' AS section;
 SELECT
     (SELECT COUNT(*) FROM orders_clean)          AS orders_clean_rows,
-    (SELECT COUNT(*) FROM order_delivery_dates)  AS order_delivery_dates_rows,
+    (SELECT COUNT(*) FROM order_dates)           AS order_dates_rows,
     (SELECT COUNT(*)
        FROM orders_clean o
-       LEFT JOIN order_delivery_dates d ON o.delivery_id = d.delivery_id
-      WHERE d.delivery_id IS NULL)               AS orders_without_delivery_match,
-    (SELECT COUNT(*) FROM order_delivery_dates
-      WHERE LENGTH(delivery_id) <> 32)           AS delivery_id_not_32_chars;
+       LEFT JOIN order_dates d ON o.dates_id = d.dates_id
+      WHERE d.dates_id IS NULL)                  AS orders_without_dates_match,
+    (SELECT CASE WHEN MIN(dates_id) = 1 AND MAX(dates_id) = COUNT(*)
+                 THEN 0 ELSE 1 END
+       FROM order_dates)                         AS dates_id_not_numbered_1_to_n;
 
-SELECT 'NULLs per date column (NULL is expected for undelivered orders):' AS section;
+SELECT 'NULLs per date column (NULL is expected for unapproved / undelivered orders):' AS section;
 SELECT
+    COUNT(*) FILTER (WHERE order_approved_at IS NULL)             AS null_approved,
     COUNT(*) FILTER (WHERE order_delivered_carrier_date IS NULL)  AS null_carrier,
     COUNT(*) FILTER (WHERE order_delivered_customer_date IS NULL) AS null_customer,
     COUNT(*) FILTER (WHERE order_estimated_delivery_date IS NULL) AS null_estimated
-FROM order_delivery_dates;
+FROM order_dates;
 
-SELECT 'Sample of order_delivery_dates:' AS section;
-SELECT * FROM order_delivery_dates LIMIT 5;
+SELECT 'Sample of order_dates:' AS section;
+SELECT * FROM order_dates LIMIT 5;
 
 
 -- ============================================================================
--- STEP 3 - ORDER ITEMS: NULL check
+-- STEP 3 - ORDER ITEMS: NULL check and key
 -- ============================================================================
 SELECT '=== STEP 3 - ORDER_ITEMS: NULL COUNT PER COLUMN ===' AS section;
 
@@ -247,6 +294,13 @@ WHERE order_id IS NULL OR order_item_id IS NULL OR product_id IS NULL
    OR seller_id IS NULL OR shipping_limit_date IS NULL
    OR price IS NULL OR freight_value IS NULL;
 
+SELECT 'order_items: repeated (order_id, order_item_id) (should be unique, it is the fact table PK):' AS section;
+SELECT order_id, order_item_id, COUNT(*) AS occurrences
+FROM order_items
+GROUP BY order_id, order_item_id
+HAVING COUNT(*) > 1
+ORDER BY occurrences DESC;
+
 
 -- ============================================================================
 -- STEP 4 - PAYMENTS: key profile
@@ -258,9 +312,18 @@ SELECT COUNT(*)                                    AS total_rows,
        COUNT(*) FILTER (WHERE order_id IS NULL)    AS null_order_id
 FROM order_payments;
 
+SELECT 'order_payments: NULL key parts or repeated (order_id, payment_sequential) (should be unique, it is the dim_payment_details PK):' AS section;
+SELECT order_id, payment_sequential, COUNT(*) AS occurrences
+FROM order_payments
+GROUP BY order_id, payment_sequential
+HAVING COUNT(*) > 1 OR order_id IS NULL OR payment_sequential IS NULL
+ORDER BY occurrences DESC;
+
 
 -- ============================================================================
 -- STEP 5 - ORPHAN CHECKS (child values with no match in the parent table)
+-- The two zip checks are logical only: dim_geo.zip is not unique, so the
+-- model cannot enforce those foreign keys. They are reported here instead.
 -- ============================================================================
 SELECT '=== STEP 5 - ORPHAN CHECKS ===' AS section;
 
@@ -306,7 +369,30 @@ SELECT 'order_payments.order_id -> orders_raw.order_id',
 FROM order_payments c
 LEFT JOIN orders_raw p ON c.order_id = p.order_id
 WHERE p.order_id IS NULL
-GROUP BY c.order_id;
+GROUP BY c.order_id
+UNION ALL
+SELECT 'order_reviews.order_id -> orders_raw.order_id',
+       c.order_id, COUNT(*)
+FROM order_reviews c
+LEFT JOIN orders_raw p ON c.order_id = p.order_id
+WHERE p.order_id IS NULL
+GROUP BY c.order_id
+UNION ALL
+SELECT 'customers.customer_zip_code_prefix -> geo.geolocation_zip_code_prefix (logical)',
+       c.customer_zip_code_prefix, COUNT(*)
+FROM customers c
+WHERE c.customer_zip_code_prefix IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM geo g
+                   WHERE g.geolocation_zip_code_prefix = c.customer_zip_code_prefix)
+GROUP BY c.customer_zip_code_prefix
+UNION ALL
+SELECT 'olist_sellers.seller_zip_code_prefix -> geo.geolocation_zip_code_prefix (logical)',
+       c.seller_zip_code_prefix, COUNT(*)
+FROM olist_sellers c
+WHERE c.seller_zip_code_prefix IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM geo g
+                   WHERE g.geolocation_zip_code_prefix = c.seller_zip_code_prefix)
+GROUP BY c.seller_zip_code_prefix;
 
 SELECT 'Orphan summary (a check with 0 orphans does not appear in the sample below):' AS section;
 WITH checked AS (
@@ -327,6 +413,15 @@ WITH checked AS (
     UNION ALL
     SELECT 'order_payments.order_id -> orders_raw.order_id',
            COUNT(DISTINCT order_id) FROM order_payments
+    UNION ALL
+    SELECT 'order_reviews.order_id -> orders_raw.order_id',
+           COUNT(DISTINCT order_id) FROM order_reviews
+    UNION ALL
+    SELECT 'customers.customer_zip_code_prefix -> geo.geolocation_zip_code_prefix (logical)',
+           COUNT(DISTINCT customer_zip_code_prefix) FROM customers
+    UNION ALL
+    SELECT 'olist_sellers.seller_zip_code_prefix -> geo.geolocation_zip_code_prefix (logical)',
+           COUNT(DISTINCT seller_zip_code_prefix) FROM olist_sellers
 ),
 orphans AS (
     SELECT fk_check,
@@ -374,6 +469,13 @@ SELECT
     COUNT(*) FILTER (WHERE product_category_name = 'sem categoria') AS rows_labelled_sem_categoria
 FROM products;
 
+SELECT 'products: NULL or repeated product_id (should be unique, it is the dim_product PK):' AS section;
+SELECT product_id, COUNT(*) AS occurrences
+FROM products
+GROUP BY product_id
+HAVING COUNT(*) > 1 OR product_id IS NULL
+ORDER BY occurrences DESC;
+
 
 -- ============================================================================
 -- STEP 7 - GEOLOCATION: NULL / EMPTY values and invalid states
@@ -412,6 +514,18 @@ WHERE geolocation_zip_code_prefix IS NULL OR TRIM(geolocation_zip_code_prefix) =
    OR geolocation_city IS NULL OR TRIM(geolocation_city) = ''
    OR geolocation_state IS NULL OR TRIM(geolocation_state) = ''
 ORDER BY zip_code_prefix, row_id;
+
+-- dim_geo keeps EVERY row of the file (zip is not unique), so exact duplicates
+-- are loaded too. This only reports how many there are.
+SELECT 'Geolocation: exact duplicated rows (all rows are kept in dim_geo):' AS section;
+SELECT COUNT(*) AS total_rows,
+       COUNT(*) - (SELECT COUNT(*)
+                     FROM (SELECT DISTINCT geolocation_zip_code_prefix, geolocation_lat,
+                                           geolocation_lng, geolocation_city,
+                                           geolocation_state
+                             FROM geo)) AS exact_duplicate_rows,
+       COUNT(DISTINCT geolocation_zip_code_prefix) AS distinct_zip_prefixes
+FROM geo;
 
 SELECT '=== STEP 7b - GEOLOCATION: STATE ===' AS section;
 
@@ -569,6 +683,13 @@ FROM seller_carriers
 GROUP BY carrier_name
 ORDER BY carrier_name NULLS FIRST;
 
+-- dim_carrier leaves out empty names, so this shows what would be dropped.
+SELECT 'Carrier: NULL or empty names after cleaning (left out of dim_carrier):' AS section;
+SELECT seller_id, carrier_name
+FROM seller_carriers
+WHERE carrier_name IS NULL OR carrier_name = ''
+ORDER BY seller_id;
+
 -- ---- 8d. Phone (validation only, no changes) --------------------------------
 -- Expected format: +55 DD 9xxxx-xxxx  ->  ^\+55\s\d{2}\s9\d{4}-\d{4}$
 SELECT '=== STEP 8d - JSON: PHONE ===' AS section;
@@ -654,6 +775,22 @@ SELECT COUNT(*) AS sellers_clean_rows FROM sellers_clean;
 SELECT 'Sellers without carriers:' AS section;
 SELECT * FROM sellers_clean WHERE carrier_name IS NULL;
 
+-- sellers_clean has one row per carrier, so the seller-level fields repeat.
+-- dim_seller collapses them to one row per seller: they must be identical.
+SELECT 'sellers_clean: sellers whose seller-level fields differ between carrier rows (should be 0):' AS section;
+SELECT COUNT(*) AS sellers_whose_json_fields_differ_between_carrier_rows
+FROM (
+    SELECT seller_id
+    FROM (
+        SELECT DISTINCT seller_id, tier, updated_at, joined_on,
+                        email, phone, shipping_time
+        FROM sellers_clean
+        WHERE seller_id IS NOT NULL
+    )
+    GROUP BY seller_id
+    HAVING COUNT(*) > 1
+);
+
 
 -- ============================================================================
 -- STEP 9 - SELLERS: correspondence between JSON, Olist CSV and order_items
@@ -683,6 +820,13 @@ SELECT seller_id
 FROM json_ids
 WHERE LENGTH(seller_id) <> 32 OR seller_id <> LOWER(TRIM(seller_id))
 LIMIT 20;
+
+SELECT 'olist_sellers: NULL or repeated seller_id (should be unique, dim_seller PK):' AS section;
+SELECT seller_id, COUNT(*) AS occurrences
+FROM olist_sellers
+GROUP BY seller_id
+HAVING COUNT(*) > 1 OR seller_id IS NULL
+ORDER BY occurrences DESC;
 
 SELECT '=== STEP 9b - SELLERS: CORRESPONDENCE CHECKS ===' AS section;
 
@@ -728,5 +872,103 @@ SELECT check_name, seller_id
 FROM seller_orphans
 QUALIFY ROW_NUMBER() OVER (PARTITION BY check_name ORDER BY seller_id) <= 20
 ORDER BY check_name, seller_id;
+
+
+-- ============================================================================
+-- STEP 10 - CATEGORY TRANSLATION: key and coverage
+-- dim_category_name_translation = this file + the categories that products use
+-- but the file does not have.
+-- ============================================================================
+SELECT '=== STEP 10 - CATEGORY TRANSLATION ===' AS section;
+
+SELECT 'Translation file: NULL or repeated product_category_name (should be unique, it is the PK):' AS section;
+SELECT product_category_name, COUNT(*) AS occurrences
+FROM category_translation
+GROUP BY product_category_name
+HAVING COUNT(*) > 1 OR product_category_name IS NULL
+ORDER BY occurrences DESC;
+
+-- Expected to include 'sem categoria' (the label given in STEP 6).
+-- dim_category_name_translation adds all of these: 'sem categoria' is
+-- translated as 'uncategorized', any other one gets a NULL English name.
+SELECT 'Categories used by products that are missing from the translation file:' AS section;
+SELECT DISTINCT p.product_category_name
+FROM products p
+WHERE p.product_category_name IS NOT NULL
+  AND NOT EXISTS (SELECT 1
+                    FROM category_translation t
+                   WHERE t.product_category_name = p.product_category_name)
+ORDER BY 1;
+
+
+-- ============================================================================
+-- STEP 11 - REVIEWS: profile (feeds dim_review and fact_order_items.review_id)
+-- dim_review has ONE row per review_id (the latest answer is kept) and has no
+-- order_id. The fact table points each order's items to that order's LATEST
+-- review; an order without reviews gets a NULL review_id.
+-- ============================================================================
+SELECT '=== STEP 11 - REVIEWS: KEY PROFILE ===' AS section;
+
+SELECT COUNT(*)                                     AS total_rows,
+       COUNT(*) FILTER (WHERE review_id IS NULL)    AS null_review_id,
+       COUNT(*) FILTER (WHERE order_id IS NULL)     AS null_order_id,
+       COUNT(DISTINCT review_id)                    AS distinct_review_id,
+       COUNT(DISTINCT order_id)                     AS distinct_order_id
+FROM order_reviews;
+
+SELECT 'review_id values that appear in more than one row (dim_review keeps one row per review_id):' AS section;
+SELECT COUNT(*)                     AS repeated_review_ids,
+       COALESCE(SUM(n), 0)          AS rows_involved,
+       COALESCE(SUM(n - 1), 0)      AS rows_left_out_of_dim_review
+FROM (
+    SELECT review_id, COUNT(*) AS n
+    FROM order_reviews
+    WHERE review_id IS NOT NULL
+    GROUP BY review_id
+    HAVING COUNT(*) > 1
+);
+
+-- Repeated review_ids whose rows are not identical: the content of the
+-- non-latest rows is what dim_review loses.
+CREATE OR REPLACE TEMP VIEW review_conflicts AS
+SELECT review_id,
+       COUNT(*)                 AS n_rows,
+       COUNT(DISTINCT order_id) AS distinct_orders
+FROM order_reviews
+WHERE review_id IS NOT NULL
+GROUP BY review_id
+HAVING COUNT(*) > 1
+   AND COUNT(DISTINCT concat_ws('|',
+           COALESCE(CAST(review_score AS VARCHAR), '<NULL>'),
+           COALESCE(CAST(review_comment_title AS VARCHAR), '<NULL>'),
+           COALESCE(CAST(review_comment_message AS VARCHAR), '<NULL>'),
+           COALESCE(CAST(review_creation_date AS VARCHAR), '<NULL>'),
+           COALESCE(CAST(review_answer_timestamp AS VARCHAR), '<NULL>'))) > 1;
+
+SELECT 'Repeated review_id whose content (score, comments, dates) differs between its rows:' AS section;
+SELECT COUNT(*) AS repeated_review_ids_with_different_content FROM review_conflicts;
+
+SELECT 'Sample of those review_id (up to 20):' AS section;
+SELECT review_id, n_rows, distinct_orders
+FROM review_conflicts
+ORDER BY n_rows DESC, review_id
+LIMIT 20;
+
+SELECT 'Orders by number of review rows (0 = fact review_id stays NULL, >1 = only the latest is linked):' AS section;
+SELECT n_reviews, COUNT(*) AS orders
+FROM (
+    SELECT o.order_id, COUNT(r.order_id) AS n_reviews
+    FROM orders_raw o
+    LEFT JOIN order_reviews r ON o.order_id = r.order_id
+    GROUP BY o.order_id
+)
+GROUP BY n_reviews
+ORDER BY n_reviews;
+
+SELECT 'Review rows whose order has no items (they cannot be reached from the fact table):' AS section;
+SELECT COUNT(*) AS review_rows
+FROM order_reviews r
+WHERE r.order_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM order_items i WHERE i.order_id = r.order_id);
 
 SELECT '=== profiling.sql finished ===' AS section;
